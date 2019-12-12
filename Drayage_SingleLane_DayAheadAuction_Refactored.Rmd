@@ -1,0 +1,248 @@
+---
+title: "Single Lane Optimization"
+output: html_notebook
+---
+
+# Day-ahead Auction Resolution/Optimization
+
+This notebook solves test auction scenarios. 
+TO DO List: 
+1. Implement Load-specific ceiling prices. -- Merge all data into 1 df
+2. Standardize Input and output format and make accessible
+3. Check assumptions about the number of Bids == Loads == Carry Capacity--> NO bids are based on capcity of the carrier and not the number of loads in the lane
+4. add simulation of data
+5. stress test and test different scenarios
+ 
+
+```{r load Libraries, message=FALSE, warning=FALSE, include=FALSE}
+
+library(tidyverse)
+library(purrr)
+
+set.seed(1988)
+
+```
+
+
+```{r Simulate Loads}
+
+# Parameters for sampling
+
+numLanes = 1
+numLoadsPerLane = c(10, 10, 10)
+#  OR
+MaxNumLoadsPerLane = 10
+numLoadsPerLane = sample(x = seq(1, 10), size = numLanes, replace = T)
+```
+
+## Load the example data of 3 Lanes and 3 Carriers
+
+Load Bids by lane, carrier, and load
+```{r Load Bids example, echo=FALSE}
+
+# Bids_df <- read_csv("/home/flai/pCloudDrive/Data/DadsDrayExample.csv") %>% 
+Bids_df <- read_csv("/home/sean/pCloudDrive/Data/ShippingContainerExample.csv") %>% 
+  gather(key = Loads, value = Bid_Price, -c(Carrier, Lanes)) %>%
+  # mutate(Bid_Price = ifelse(Bid_Price == 0, 9999*max(Bid_Price), Bid_Price)) %>% 
+  filter(Bid_Price != 0) %>% 
+  rename(Lane = Lanes,
+         numLoadsBid = Loads) %>% 
+  mutate(numLoadsBid = as.numeric(numLoadsBid)) %>% 
+  group_by(Lane) %>% 
+  mutate(BidID = 1:n()) %>% 
+  ungroup()
+
+Bids_df
+
+Bids_df_byLane <- Bids_df %>% group_by(Lane) %>% group_split()
+```
+
+Simulate the Loads and ceiling prices for each lane
+```{r Load or Simulate Lane Data, echo=FALSE}
+  Lanes_df <- expand.grid(Lane = seq(1,numLanes),
+                          LoadID = seq(1, MaxNumLoadsPerLane)) %>% 
+  mutate(., Ceiling_Price = sample(x = c(540, 390, 550, 500, 525, 475), size = nrow(.), replace = T)) %>% 
+  group_by(Lane) %>% 
+  ungroup()
+
+# Lanes_df$Ceiling_Price <- 500
+# Lanes_df %>% group_by(Lane) %>% summarise(mean(Ceiling_Price)) #when Individual loads in a lane have different ceiling prices
+Loads_df_byLane <- Lanes_df %>% group_by(Lane) %>% group_split()
+Loads_df_byLane
+```
+
+
+
+```{r Merge Data Sets}
+
+Merged_df <- Bids_df %>% 
+  left_join(., Lanes_df) 
+
+```
+
+
+## Objective Function
+Decide what strategy or objective we are trying to optimize. Optimize with ceiling constraint or maximize number of loads taken and set the ceiling price (currently the same ceiling price across all lanes)
+
+```{r Pre-opt parameters}
+# maxNumLoads_setting <- F
+# If param is set to T, maximize number of loads by checking ceiling price average per load across the net for the entire lane
+# If param is set to F, each bid considered must have a bid price per load below the ceiling
+```
+
+```{r Preprocessing}
+
+numberLanes <- n_distinct(Lanes_df$Lane)
+numCarriers <- n_distinct(Bids_df$Carrier)
+numBids_byLane <- Merged_df %>% group_by(Lane) %>% group_size()
+
+MergedData_byLane <- Merged_df %>% mutate(CP_Delta = Ceiling_Price - Bid_Price) %>% group_by(Lane) %>% group_split()
+
+```
+
+## Approach
+Treat every lane as a separate auction! Each number of loads from a carrier is a separate bid, with only 1 bid acceptable per carrier. 
+
+### lpSolve Algorithm
+
+```{r Individual Load Pricing Model}
+library(lpSolveAPI)
+
+  weight_Profit <- .01
+  
+  for (lane in seq(1, numberLanes)) {
+  
+  numBid_LoadCombinations <-  numBids_byLane[[lane]]
+  numLoads <- nrow(Loads_df_byLane[[lane]])
+  numBids <- max(MergedData_byLane[[lane]]$BidID)
+  lprec <- NULL
+  lprec <- make.lp(0, numBid_LoadCombinations+numBids)
+  # Set the objective function
+  set.objfn(lprec, 
+            obj = c(weight_Profit*MergedData_byLane[[lane]]$CP_Delta,
+                    Bids_df_byLane[[lane]]$numLoadsBid))
+  
+  # add constraints
+  # loads
+  
+  # Each Load can only be used 1 time
+  for (load in seq(1, numLoads)) {
+    add.constraint(lprec,
+                   xt = rep(x = 1,
+                            times = sum(MergedData_byLane[[lane]]$LoadID == load)),
+                   indices = which(MergedData_byLane[[lane]]$LoadID == load),
+                   "<=", rhs = 1)
+  }
+  
+  # Global sum of loads used must be <= total number of loads available in the lane
+  add.constraint(lprec,
+                 xt = rep(x = 1,
+                          times = numBid_LoadCombinations),
+                 indices = 1:numBid_LoadCombinations,
+                 "<=", rhs = nrow(Loads_df_byLane[[lane]]))
+  
+  add.constraint(lprec,
+                 xt = Bids_df_byLane[[lane]]$numLoadsBid,
+                 indices = (numBid_LoadCombinations+1):(numBid_LoadCombinations+numBids),
+                 "<=", rhs = nrow(Loads_df_byLane[[lane]]))
+  
+  # carriers
+  # only 1 bid per carrier
+  for (carrier in seq(1, numCarriers)) {
+    add.constraint(lprec,
+            xt = rep(x = 1,
+                     times = sum(Bids_df_byLane[[lane]]$Carrier == unique(Bids_df_byLane[[lane]]$Carrier)[[carrier]])),
+            indices = numBid_LoadCombinations+ which(Bids_df_byLane[[lane]]$Carrier == unique(Bids_df_byLane[[lane]]$Carrier)[[carrier]]),
+            "<=", rhs = 1)
+  }
+  
+  # bid amounts == loads carried
+  for (bid in seq(1, numBids)) {
+    add.constraint(lprec,
+            xt = 1,
+            indices = numBid_LoadCombinations+bid,
+            "<=", rhs = 1)
+    
+    add.constraint(lprec,
+            xt = c(rep(x=(1/Bids_df_byLane[[lane]]$numLoadsBid[[bid]]), times = sum(MergedData_byLane[[lane]]$BidID == bid)),
+                   -1),
+            indices = c(which(MergedData_byLane[[lane]]$BidID == bid),numBid_LoadCombinations+bid),
+            "=", rhs = 0)
+    
+    add.constraint(lprec,
+            xt = c(rep(x=1, times = sum(MergedData_byLane[[lane]]$BidID == bid)),
+                   -Bids_df_byLane[[lane]]$numLoadsBid[[bid]]),
+            indices = c(which(MergedData_byLane[[lane]]$BidID == bid),numBid_LoadCombinations+bid),
+            "=", rhs = 0)
+  }
+  
+  
+  #Make decision variables binary and integer semi-continuous
+  # set.type(lprec, 1:numBid_LoadCombinations, type = "binary")
+  set.type(lprec, columns = 1:(numBid_LoadCombinations+numBids), type = "binary") # set all decision vars to binary
+
+  # set.type(lprec, (numBid_LoadCombinations+1):(numBid_LoadCombinations+numBids), type = "integer")
+  # set.semicont(lprec, (numBid_LoadCombinations+1):(numBid_LoadCombinations+numBids))
+  # set.bounds(lprec,
+  #            lower = Bids_df_byLane[[lane]]$numLoadsBid,
+  #            upper = Bids_df_byLane[[lane]]$numLoadsBid,
+  #            columns = (numBid_LoadCombinations+1):(numBid_LoadCombinations+numBids))
+
+  # Set to maximize or minimize depending on maxNumLoads_setting
+  lp.control(lprec, sense='max') 
+  
+  # Solve the model
+  solve(lprec)
+  
+  # Record Results
+  MergedData_byLane[[lane]]$UseBid <- get.variables(lprec)[1:numBid_LoadCombinations]
+  # Lanes_df$TotalSavings[lane] <-
+    get.objective(lprec)
+  # Lanes_df$LoadsMoved[lane] <- 
+    # sum(MergedData_byLane[[lane]]$UseBid*MergedData_byLane[[lane]]$Loads)
+ 
+  }
+```
+
+
+Results of the optimization have been written to "r savename". Sample Table of the Bid Accept/Reject decisions is below
+
+```{r Auction Results, echo=FALSE}
+
+Results
+```
+
+
+Aggregate summary of the auction outcomes by lane are shown in the following table.
+
+```{r Show Lane Summaries, echo=FALSE}
+Lanes_df
+```
+
+
+
+
+### Evolutionary/Genetic Algorithm
+
+This algorithm will be more useful for the "fuzzy" variable of forecasted supply/demand or for maximizing both quantity and savings.
+
+
+```{r GA, eval=FALSE, include=FALSE}
+
+library(GA) 
+
+fitness <- function(x) {
+  
+  Profit <- weight_Profit*MergedData_byLane[[lane]]$CP_Delta
+  
+  NumLoadsCarried = sum(MergedData_byLane[[lane]]$numLoadsBid)
+  
+  
+  fitness <- w_profit*Profit + w_loads*NumLoadsCarried
+  
+  return(fitness)
+}
+
+```
+
+
